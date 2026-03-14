@@ -51,18 +51,16 @@ def get_page_size(presentation_id: str, access_token: str) -> tuple[int, int]:
         return (DEFAULT_PAGE_WIDTH_EMU, DEFAULT_PAGE_HEIGHT_EMU)
 
 
-def get_slide_list(presentation_id: str, access_token: str) -> list[dict]:
-    """Return list of slide objectIds in order. Each entry: {"objectId": "...", "index": 0}."""
+def get_full_presentation(presentation_id: str, access_token: str) -> dict:
+    """Fetch the entire presentation (all slides, elements, page size) in one API call."""
     headers = {"Authorization": f"Bearer {access_token}"}
     r = httpx.get(
         f"{SLIDES_API}/{presentation_id}",
         headers=headers,
-        params={"fields": "slides.objectId"},
-        timeout=15.0,
+        timeout=30.0,
     )
     r.raise_for_status()
-    slides = r.json().get("slides", [])
-    return [{"objectId": s["objectId"], "index": i} for i, s in enumerate(slides)]
+    return r.json()
 
 
 def get_slide_elements(
@@ -113,9 +111,10 @@ def _summarize_element(el: dict) -> Optional[dict]:
     x_pt = tx / PT_TO_EMU
     y_pt = ty / PT_TO_EMU
 
-    # Determine element type and text content
+    # Determine element type, text content, and text style
     el_type = "shape"
     text_content = ""
+    text_style_desc = ""
     if "shape" in el:
         shape_type = el["shape"].get("shapeType", "RECTANGLE")
         if shape_type == "TEXT_BOX":
@@ -123,11 +122,39 @@ def _summarize_element(el: dict) -> Optional[dict]:
         else:
             el_type = f"shape ({shape_type})"
         text_runs = []
+        styles_seen = []
         for te in (el["shape"].get("text", {}).get("textElements", [])):
             run = te.get("textRun", {})
-            if run.get("content", "").strip():
-                text_runs.append(run["content"].strip())
+            content = run.get("content", "").strip()
+            if content:
+                text_runs.append(content)
+            style = run.get("style", {})
+            if style and content:
+                s_parts = []
+                font = style.get("fontFamily")
+                if font:
+                    s_parts.append(font)
+                fs = style.get("fontSize", {})
+                if fs.get("magnitude"):
+                    s_parts.append(f"{fs['magnitude']}{fs.get('unit', 'PT').lower()}")
+                if style.get("bold"):
+                    s_parts.append("bold")
+                if style.get("italic"):
+                    s_parts.append("italic")
+                fg = style.get("foregroundColor", {}).get("opaqueColor", {}).get("rgbColor", {})
+                if fg:
+                    r_val = int(fg.get("red", 0) * 255)
+                    g_val = int(fg.get("green", 0) * 255)
+                    b_val = int(fg.get("blue", 0) * 255)
+                    hex_color = f"#{r_val:02x}{g_val:02x}{b_val:02x}"
+                    if hex_color != "#000000":
+                        s_parts.append(hex_color)
+                if s_parts:
+                    styles_seen.append(" ".join(s_parts))
         text_content = " ".join(text_runs)
+        if styles_seen:
+            unique_styles = list(dict.fromkeys(styles_seen))
+            text_style_desc = " | ".join(unique_styles[:3])
     elif "image" in el:
         el_type = "image"
     elif "table" in el:
@@ -145,6 +172,8 @@ def _summarize_element(el: dict) -> Optional[dict]:
     }
     if text_content:
         summary["text"] = text_content[:100]
+    if text_style_desc:
+        summary["style"] = text_style_desc
     return summary
 
 
@@ -172,69 +201,162 @@ def _build_slide_description(
         desc = f'  - objectId: "{s["objectId"]}", type: {s["type"]}, position: ({s["x_pt"]}, {s["y_pt"]}) PT, size: {s["width_pt"]} x {s["height_pt"]} PT'
         if s.get("text"):
             desc += f', text: "{s["text"]}"'
+        if s.get("style"):
+            desc += f', style: [{s["style"]}]'
         lines.append(desc)
 
     return "\n".join(lines)
 
 
-SLIDES_LLM_SYSTEM = """You are a Google Slides layout assistant. You receive a description of a slide's elements (positions, sizes, types), presentation context (total slides, current slide index), and a user request. You output a JSON array of instructions.
+def _summarize_slide_brief(slide: dict, index: int) -> str:
+    """Short summary of a slide (for non-current slides), including text style."""
+    elements = slide.get("pageElements", [])
+    texts = []
+    styles = []
+    for el in elements:
+        for te in el.get("shape", {}).get("text", {}).get("textElements", []):
+            run = te.get("textRun", {})
+            t = run.get("content", "").strip()
+            if t:
+                texts.append(t)
+            style = run.get("style", {})
+            if style and t:
+                s_parts = []
+                font = style.get("fontFamily")
+                if font:
+                    s_parts.append(font)
+                fs = style.get("fontSize", {})
+                if fs.get("magnitude"):
+                    s_parts.append(f"{fs['magnitude']}{fs.get('unit', 'PT').lower()}")
+                if style.get("bold"):
+                    s_parts.append("bold")
+                if s_parts:
+                    styles.append(" ".join(s_parts))
+    combined = " | ".join(texts)
+    if len(combined) > 150:
+        combined = combined[:150] + "..."
+    el_count = len(elements)
+    unique_styles = list(dict.fromkeys(styles))
+    style_str = f" (style: {', '.join(unique_styles[:2])})" if unique_styles else ""
+    if combined:
+        return f"  Slide {index} ({el_count} elements): \"{combined}\"{style_str}"
+    return f"  Slide {index} ({el_count} elements): [no text]{style_str}"
+
+
+def _build_full_presentation_context(
+    presentation: dict, current_page_id: Optional[str], page_width_emu: int, page_height_emu: int,
+) -> tuple[str, Optional[dict], int, Optional[int]]:
+    """
+    Build context string with ALL slides summarized.
+    Returns (context_string, current_page_json, total_slides, current_slide_index).
+    """
+    slides = presentation.get("slides", [])
+    total = len(slides)
+    current_index = None
+    current_page_json = None
+
+    # Find current slide
+    for i, s in enumerate(slides):
+        if s.get("objectId") == current_page_id:
+            current_index = i
+            current_page_json = s
+            break
+
+    # Build other slides summary
+    other_lines = []
+    for i, s in enumerate(slides):
+        if i == current_index:
+            continue
+        other_lines.append(_summarize_slide_brief(s, i))
+
+    # Build current slide detail
+    if current_page_json:
+        current_desc = _build_slide_description(current_page_json, page_width_emu, page_height_emu)
+    else:
+        current_desc = "(Could not find the current slide)"
+
+    lines = [
+        f"=== PRESENTATION ({total} slides) ===",
+        f"Title: {presentation.get('title', 'Untitled')}",
+        "",
+        f"=== CURRENT SLIDE (index {current_index}, the slide the user is viewing) ===",
+        current_desc,
+        "",
+        f"=== OTHER SLIDES (summary) ===",
+    ]
+    lines.extend(other_lines if other_lines else ["  (no other slides)"])
+
+    return "\n".join(lines), current_page_json, total, current_index
+
+
+SLIDES_LLM_SYSTEM = """You are a Google Slides layout assistant. You receive a detailed description of the current slide's elements, a summary of ALL other slides in the presentation, and a user request. You output JSON instructions.
+
+*** CRITICAL RULE — create_text_box vs create_slide ***
+- DEFAULT to "create_text_box" when the user wants to ADD content to the CURRENT slide (e.g. "add a section", "add text about X", "add a box at the bottom", "put a summary here", "add content about Y").
+- ONLY use "create_slide" when the user EXPLICITLY says "new slide", "create a slide", "add a slide", or "next slide".
+- If ambiguous, ALWAYS prefer create_text_box on the current slide.
+***
 
 Supported instruction types:
 
 1. Layout instructions (edit existing elements):
 - "action": one of "move", "resize", or "move_and_resize"
 - "objectId": the element's objectId (string)
-- "x_pt": new X position in points (for move/move_and_resize)
-- "y_pt": new Y position in points (for move/move_and_resize)
-- "width_pt": new width in points (for resize/move_and_resize)
-- "height_pt": new height in points (for resize/move_and_resize)
+- "x_pt", "y_pt": new position in points (for move/move_and_resize)
+- "width_pt", "height_pt": new size in points (for resize/move_and_resize)
 
-2. Create slide instruction:
+2. Create text box (add a NEW text box to the CURRENT slide):
+- "action": "create_text_box"
+- "x_pt": X position in points
+- "y_pt": Y position in points
+- "width_pt": width in points
+- "height_pt": height in points
+- "text": text content (string)
+- Optional style: "font_size_pt", "bold", "italic", "underline", "font_family", "color" (hex)
+
+3. Create slide (add a BRAND NEW SLIDE — only when user explicitly asks):
 - "action": "create_slide"
 - "layout": one of "BLANK", "TITLE", "TITLE_AND_BODY", "TITLE_AND_TWO_COLUMNS", "TITLE_ONLY", "SECTION_HEADER", "CAPTION_ONLY", "BIG_NUMBER"
-- "insert_after": "current" (after the slide the user is viewing) or "end" (at the end) or a 0-based index number
-- "title": optional title text for the slide
-- "body": optional body text for the slide
+- "insert_after": "current", "end", or a 0-based index number
+- "title": optional title text
+- "body": optional body text
 
-3. Replace text instruction (replace ALL text in an element):
+4. Replace text (replace ALL text in an existing element):
 - "action": "replace_text"
 - "objectId": the element's objectId (string)
 - "new_text": the replacement text (string)
 
-4. Update text style instruction (change formatting of ALL text in an element):
+5. Update text style (change formatting of ALL text in an existing element):
 - "action": "update_text_style"
 - "objectId": the element's objectId (string)
-- Include one or more of these optional style fields:
-  - "font_size_pt": font size in points (number, e.g. 24)
-  - "bold": true or false
-  - "italic": true or false
-  - "underline": true or false
-  - "font_family": font name (string, e.g. "Arial", "Times New Roman", "Roboto")
-  - "color": hex color string (e.g. "#FF0000" for red, "#0000FF" for blue, "#FFFFFF" for white)
+- Style fields (include one or more): "font_size_pt", "bold", "italic", "underline", "font_family", "color" (hex)
 
 Rules:
 - Positions are from the top-left corner of the slide (origin 0,0).
-- Only include elements you want to change. Do NOT include elements that should stay where they are.
-- Output ONLY the JSON array, no explanation, no markdown fences.
-- If no changes are needed, output an empty array: []
+- Only include elements you want to change.
 - Be precise with numbers. Think about centering, alignment, and spacing.
-- When making elements symmetrical, consider both their positions AND sizes relative to the slide center.
 - The slide center X is half the slide width. The slide center Y is half the slide height.
-- For create_slide: choose a layout that fits the user's request. If they ask for a title slide, use "TITLE". If they want a slide with content, use "TITLE_AND_BODY". If they don't specify, use "BLANK".
-- You can combine create_slide with layout instructions in the same array (e.g. create a slide then move elements on the current slide).
-- When the user says "create a slide about X", generate appropriate title and body text for the topic.
-- For replace_text: this replaces ALL text in the element. Use it when the user wants to change what text says.
-- For update_text_style: this applies to ALL text in the element. Use it for font size, color, bold, italic, underline, font family changes.
-- You can combine update_text_style with replace_text on the same element (e.g. change text AND make it bold).
-- When the user says "make all text bigger" or "change font size", apply update_text_style to every text element on the slide."""
+- For create_text_box: position it to avoid overlapping existing elements. Match the slide's existing font/style when possible.
+- For create_slide: choose a fitting layout. Generate appropriate title/body text for the topic.
+- For replace_text: replaces ALL text in the element.
+- For update_text_style: applies to ALL text in the element.
+- You can combine multiple instructions (e.g. create_text_box + move existing elements to make room).
+- When matching formatting across slides, use style info from other slides' summaries.
+
+Output format:
+- Output a JSON OBJECT with two keys:
+  - "instructions": JSON array of instructions (empty [] if no changes needed)
+  - "message": brief natural-language summary of what you did or answered
+- No markdown fences. Output ONLY the JSON object.
+- For questions about the presentation, output empty instructions and put the answer in "message"."""
 
 
 def _ask_llm_for_instructions(
     slide_description: str, user_message: str
-) -> list[dict]:
+) -> tuple[list[dict], str]:
     """
     Ask the LLM to generate layout instructions given the slide and user request.
-    Returns a list of instruction dicts.
+    Returns (instructions_list, message_string).
     """
     messages = [
         SystemMessage(content=SLIDES_LLM_SYSTEM),
@@ -254,14 +376,22 @@ def _ask_llm_for_instructions(
     print(f"   SLIDES LLM raw response: {text[:500]}")
 
     try:
-        instructions = json.loads(text)
-        if not isinstance(instructions, list):
-            print(f"   SLIDES LLM returned non-list: {type(instructions)}")
-            return []
-        return instructions
+        parsed = json.loads(text)
+        # New format: {"instructions": [...], "message": "..."}
+        if isinstance(parsed, dict) and "instructions" in parsed:
+            instructions = parsed.get("instructions", [])
+            llm_message = parsed.get("message", "")
+            if not isinstance(instructions, list):
+                instructions = []
+            return instructions, llm_message
+        # Fallback: old format (raw array)
+        if isinstance(parsed, list):
+            return parsed, ""
+        print(f"   SLIDES LLM returned unexpected type: {type(parsed)}")
+        return [], ""
     except json.JSONDecodeError as e:
         print(f"   SLIDES LLM JSON parse error: {e}")
-        return []
+        return [], ""
 
 
 def _gen_id(prefix: str = "dex2") -> str:
@@ -335,6 +465,94 @@ def _create_and_populate_slide(
     return f"Created slide ({layout}) with content"
 
 
+def _create_text_box(
+    inst: dict,
+    presentation_id: str,
+    page_id: str,
+    access_token: str,
+) -> str:
+    """
+    Create a text box on the specified slide with optional text and styling.
+    Returns a status message.
+    """
+    obj_id = _gen_id("txtbox")
+    x_pt = inst.get("x_pt", 50)
+    y_pt = inst.get("y_pt", 50)
+    width_pt = inst.get("width_pt", 400)
+    height_pt = inst.get("height_pt", 100)
+    text = inst.get("text", "")
+
+    requests = [
+        {
+            "createShape": {
+                "objectId": obj_id,
+                "shapeType": "TEXT_BOX",
+                "elementProperties": {
+                    "pageObjectId": page_id,
+                    "size": {
+                        "width": {"magnitude": width_pt, "unit": "PT"},
+                        "height": {"magnitude": height_pt, "unit": "PT"},
+                    },
+                    "transform": {
+                        "scaleX": 1,
+                        "scaleY": 1,
+                        "shearX": 0,
+                        "shearY": 0,
+                        "translateX": x_pt * PT_TO_EMU,
+                        "translateY": y_pt * PT_TO_EMU,
+                        "unit": "EMU",
+                    },
+                },
+            }
+        }
+    ]
+
+    if text:
+        requests.append({
+            "insertText": {
+                "objectId": obj_id,
+                "text": text,
+                "insertionIndex": 0,
+            }
+        })
+
+    style = {}
+    fields = []
+    if "font_size_pt" in inst:
+        style["fontSize"] = {"magnitude": inst["font_size_pt"], "unit": "PT"}
+        fields.append("fontSize")
+    if "bold" in inst:
+        style["bold"] = inst["bold"]
+        fields.append("bold")
+    if "italic" in inst:
+        style["italic"] = inst["italic"]
+        fields.append("italic")
+    if "underline" in inst:
+        style["underline"] = inst["underline"]
+        fields.append("underline")
+    if "font_family" in inst:
+        style["fontFamily"] = inst["font_family"]
+        fields.append("fontFamily")
+    if "color" in inst:
+        style["foregroundColor"] = {
+            "opaqueColor": {"rgbColor": _hex_to_rgb(inst["color"])}
+        }
+        fields.append("foregroundColor")
+
+    if style and fields and text:
+        requests.append({
+            "updateTextStyle": {
+                "objectId": obj_id,
+                "textRange": {"type": "ALL"},
+                "style": style,
+                "fields": ",".join(fields),
+            }
+        })
+
+    execute_batch_update(presentation_id, requests, access_token)
+    return f"Created text box '{text[:40]}...' at ({x_pt}, {y_pt})" if len(text) > 40 else f"Created text box '{text}' at ({x_pt}, {y_pt})"
+
+
 def _hex_to_rgb(hex_color: str) -> dict:
     """Convert '#RRGGBB' to Slides API rgbColor (0.0-1.0 floats)."""
     h = hex_color.lstrip("#")
@@ -363,7 +581,7 @@ def _edit_instructions_to_batch_requests(
     for inst in instructions:
         action = inst.get("action")
 
-        if action == "create_slide":
+        if action in ("create_slide", "create_text_box"):
             continue
 
         obj_id = inst.get("objectId")
@@ -536,42 +754,62 @@ def handle_edit_slides(
         return "I can't tell which slide you're on. Click on a slide so the URL shows #slide=id.XXX, then try again."
 
     try:
-        page_width, page_height = get_page_size(presentation_id, access_token)
-        page_json = get_slide_elements(presentation_id, page_id, access_token)
-        slide_list = get_slide_list(presentation_id, access_token)
+        presentation = get_full_presentation(presentation_id, access_token)
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 401:
             return "Google token expired or missing Slides permission. Please Disconnect Google, then Connect Google again."
-        return f"Failed to read the slide (HTTP {e.response.status_code}). Check that the Slides API is enabled in Google Cloud."
+        return f"Failed to read the presentation (HTTP {e.response.status_code}). Check that the Slides API is enabled in Google Cloud."
     except Exception as e:
-        return f"Error reading slide: {e}"
+        return f"Error reading presentation: {e}"
 
-    current_slide_index = None
-    for s in slide_list:
-        if s["objectId"] == page_id:
-            current_slide_index = s["index"]
-            break
-    total_slides = len(slide_list)
+    page_size = presentation.get("pageSize", {})
+    page_width = int(page_size.get("width", {}).get("magnitude", DEFAULT_PAGE_WIDTH_EMU))
+    page_height = int(page_size.get("height", {}).get("magnitude", DEFAULT_PAGE_HEIGHT_EMU))
 
-    slide_desc = _build_slide_description(page_json, page_width, page_height)
-    pres_context = f"\nPresentation has {total_slides} slide(s). Current slide is index {current_slide_index} (0-based)."
-    full_desc = slide_desc + pres_context
-    print(f"   SLIDES: Slide description:\n{full_desc}")
+    full_desc, page_json, total_slides, current_slide_index = _build_full_presentation_context(
+        presentation, page_id, page_width, page_height,
+    )
+
+    if not page_json:
+        return "I can't find the current slide in the presentation. Try clicking on the slide and sending your request again."
+
+    print(f"   SLIDES: Full presentation context:\n{full_desc[:2000]}{'...(truncated)' if len(full_desc) > 2000 else ''}")
 
     try:
-        instructions = _ask_llm_for_instructions(full_desc, user_message)
+        instructions, llm_message = _ask_llm_for_instructions(full_desc, user_message)
     except Exception as e:
         return f"Error getting layout instructions from LLM: {e}"
 
     if not instructions:
+        if llm_message:
+            return llm_message
         return "The AI couldn't determine any changes for this request. Try being more specific (e.g. 'create a title slide about AI' or 'center the two text boxes')."
 
     print(f"   SLIDES: {len(instructions)} instructions from LLM")
 
     slides_created = 0
     elements_updated = 0
+    textboxes_created = 0
 
-    # Handle create_slide instructions first
+    # Handle create_text_box instructions
+    textbox_instructions = [i for i in instructions if i.get("action") == "create_text_box"]
+    for ti in textbox_instructions:
+        try:
+            result = _create_text_box(ti, presentation_id, page_id, access_token)
+            print(f"   SLIDES: {result}")
+            textboxes_created += 1
+        except httpx.HTTPStatusError as e:
+            error_body = ""
+            try:
+                error_body = e.response.text[:300]
+            except Exception:
+                pass
+            print(f"   SLIDES: create_text_box failed (HTTP {e.response.status_code}): {error_body}")
+            return f"Failed to create text box (HTTP {e.response.status_code}). Error: {error_body}"
+        except Exception as e:
+            return f"Error creating text box: {e}"
+
+    # Handle create_slide instructions
     create_instructions = [i for i in instructions if i.get("action") == "create_slide"]
     for ci in create_instructions:
         try:
@@ -608,13 +846,20 @@ def handle_edit_slides(
         except Exception as e:
             return f"Error updating elements: {e}"
 
-    if not slides_created and not elements_updated:
+    if not slides_created and not elements_updated and not textboxes_created:
+        if llm_message:
+            return llm_message
         return "No valid changes could be generated. Try being more specific."
 
     parts = []
+    if textboxes_created:
+        parts.append(f"added {textboxes_created} text box{'es' if textboxes_created != 1 else ''}")
     if slides_created:
         parts.append(f"created {slides_created} new slide{'s' if slides_created != 1 else ''}")
     if elements_updated:
         parts.append(f"updated {elements_updated} element{'s' if elements_updated != 1 else ''}")
     summary = " and ".join(parts)
-    return f"Done! I {summary}. Refresh your Slides tab to see the changes."
+    result_msg = f"Done! I {summary}. Refresh your Slides tab to see the changes."
+    if llm_message:
+        result_msg += f"\n\n{llm_message}"
+    return result_msg
