@@ -5,11 +5,11 @@ import Login from './components/Login'
 import SignUp from './components/SignUp'
 import { Message } from './types'
 import { openTabFromMessage, openEmailCompose } from './Tools'
-import { getGoogleTokens, clearGoogleTokens } from './utils/googleAuth'
+import { getGoogleTokens, clearGoogleTokens, getValidGoogleAccessToken } from './utils/googleAuth'
 import './App.css'
 
 const API_URL = 'http://localhost:8000'
-const GOOGLE_SCOPES = 'https://www.googleapis.com/auth/spreadsheets.readonly https://www.googleapis.com/auth/documents.readonly'
+const GOOGLE_SCOPES = 'https://www.googleapis.com/auth/spreadsheets.readonly https://www.googleapis.com/auth/documents.readonly https://www.googleapis.com/auth/presentations'
 
 function App() {
   const { user, loading, signOut } = useAuth()
@@ -110,11 +110,31 @@ function Chatbot({ signOut }: ChatbotProps) {
           content: msg.content
         }))
 
+      // Get active tab URL for context (e.g. Google Slides editing)
+      let currentTabUrl: string | undefined
+      const c = typeof chrome !== 'undefined' ? chrome : (window as any).chrome
+      if (c?.tabs?.query) {
+        try {
+          const [tab] = await c.tabs.query({ active: true, currentWindow: true })
+          currentTabUrl = tab?.url
+        } catch (_) {}
+      }
+
+      // Get Google token for Slides API access
+      const googleToken = await getValidGoogleAccessToken(API_URL)
+
+      const headers: Record<string, string> = {}
+      if (googleToken) {
+        headers['X-Google-Access-Token'] = googleToken
+      }
+
       const response = await authenticatedFetch(`${API_URL}/chat`, {
         method: 'POST',
+        headers,
         body: JSON.stringify({
           message: message,
-          conversation_history: conversationHistory
+          conversation_history: conversationHistory,
+          current_tab_url: currentTabUrl ?? null,
         })
       })
 
@@ -134,6 +154,9 @@ function Chatbot({ signOut }: ChatbotProps) {
       if (data.action === 'send_email' && data.email_url) {
         console.log('[Chat] SEND_EMAIL: opening Gmail compose')
         openEmailCompose(data.email_url)
+      }
+      if (data.action === 'edit_slides') {
+        console.log('[Chat] EDIT_SLIDES: slide updated')
       }
     } catch (error: any) {
       console.error('Error:', error)
