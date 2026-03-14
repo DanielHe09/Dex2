@@ -63,6 +63,7 @@ class ChatRequest(BaseModel):
     """Request model for chat endpoint"""
     message: str
     conversation_history: Optional[List[Message]] = []
+    current_tab_url: Optional[str] = None
 
 
 class ActionType(str, Enum):
@@ -70,6 +71,7 @@ class ActionType(str, Enum):
     CHAT_ONLY = "chat_only"
     OPEN_TAB = "open_tab"
     SEND_EMAIL = "send_email"
+    EDIT_SLIDES = "edit_slides"
 
 
 class ChatResponse(BaseModel):
