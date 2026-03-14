@@ -500,7 +500,7 @@ Action rules:
 - Use "open_tab" if the user's query requires opening a new browser tab or webpage (e.g., "open YouTube", "search for Python tutorials", "go to github.com")
 - When using "open_tab", you MUST include the full URL to open in the "msg" field (e.g. "Opening https://www.wikipedia.org for you." or "Here is the link: https://youtube.com") so the client can open it. Never use "open_tab" with a msg that does not contain a literal https:// or http:// URL.
 - Use "send_email" when the user explicitly wants to send, compose, or draft an email (e.g., "send an email to John", "email my team about the meeting", "compose an email to support@example.com"). When using "send_email" you MUST also include "email_to", "email_subject", and "email_body" in the JSON so the client can open a Gmail draft. Do NOT use "send_email" for general questions about email—only when the user wants to actually send one.
-- Use "edit_slides" when the user is currently on a Google Slides tab (the current tab URL contains docs.google.com/presentation) AND asks to modify slide layout, alignment, symmetry, positioning, or create/edit slide content. Put a brief description of what you will do in "msg" (e.g., "Making the text boxes symmetrical on this slide.").
+- Use "edit_slides" when the user is currently on a Google Slides tab (the current tab URL contains docs.google.com/presentation) AND asks to modify slide layout, alignment, symmetry, positioning, create a new slide, or generate slide content. Put a brief description of what you will do in "msg" (e.g., "Making the text boxes symmetrical on this slide." or "Creating a new slide about AI.").
 - Use "chat_only" for all other queries (answering questions, explanations, general conversation)
 
 When answering:

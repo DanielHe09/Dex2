@@ -5,6 +5,7 @@ translate to Slides API batchUpdate requests.
 
 import json
 import re
+import uuid
 from typing import Optional
 import httpx
 from langchain_agent import llm
@@ -48,6 +49,20 @@ def get_page_size(presentation_id: str, access_token: str) -> tuple[int, int]:
         return (int(w), int(h))
     except Exception:
         return (DEFAULT_PAGE_WIDTH_EMU, DEFAULT_PAGE_HEIGHT_EMU)
+
+
+def get_slide_list(presentation_id: str, access_token: str) -> list[dict]:
+    """Return list of slide objectIds in order. Each entry: {"objectId": "...", "index": 0}."""
+    headers = {"Authorization": f"Bearer {access_token}"}
+    r = httpx.get(
+        f"{SLIDES_API}/{presentation_id}",
+        headers=headers,
+        params={"fields": "slides.objectId"},
+        timeout=15.0,
+    )
+    r.raise_for_status()
+    slides = r.json().get("slides", [])
+    return [{"objectId": s["objectId"], "index": i} for i, s in enumerate(slides)]
 
 
 def get_slide_elements(
@@ -162,15 +177,40 @@ def _build_slide_description(
     return "\n".join(lines)
 
 
-SLIDES_LLM_SYSTEM = """You are a Google Slides layout assistant. You receive a description of a slide's elements (positions, sizes, types) and a user request. You output a JSON array of layout instructions.
+SLIDES_LLM_SYSTEM = """You are a Google Slides layout assistant. You receive a description of a slide's elements (positions, sizes, types), presentation context (total slides, current slide index), and a user request. You output a JSON array of instructions.
 
-Each instruction is an object with these fields:
+Supported instruction types:
+
+1. Layout instructions (edit existing elements):
 - "action": one of "move", "resize", or "move_and_resize"
 - "objectId": the element's objectId (string)
 - "x_pt": new X position in points (for move/move_and_resize)
 - "y_pt": new Y position in points (for move/move_and_resize)
 - "width_pt": new width in points (for resize/move_and_resize)
 - "height_pt": new height in points (for resize/move_and_resize)
+
+2. Create slide instruction:
+- "action": "create_slide"
+- "layout": one of "BLANK", "TITLE", "TITLE_AND_BODY", "TITLE_AND_TWO_COLUMNS", "TITLE_ONLY", "SECTION_HEADER", "CAPTION_ONLY", "BIG_NUMBER"
+- "insert_after": "current" (after the slide the user is viewing) or "end" (at the end) or a 0-based index number
+- "title": optional title text for the slide
+- "body": optional body text for the slide
+
+3. Replace text instruction (replace ALL text in an element):
+- "action": "replace_text"
+- "objectId": the element's objectId (string)
+- "new_text": the replacement text (string)
+
+4. Update text style instruction (change formatting of ALL text in an element):
+- "action": "update_text_style"
+- "objectId": the element's objectId (string)
+- Include one or more of these optional style fields:
+  - "font_size_pt": font size in points (number, e.g. 24)
+  - "bold": true or false
+  - "italic": true or false
+  - "underline": true or false
+  - "font_family": font name (string, e.g. "Arial", "Times New Roman", "Roboto")
+  - "color": hex color string (e.g. "#FF0000" for red, "#0000FF" for blue, "#FFFFFF" for white)
 
 Rules:
 - Positions are from the top-left corner of the slide (origin 0,0).
@@ -179,7 +219,14 @@ Rules:
 - If no changes are needed, output an empty array: []
 - Be precise with numbers. Think about centering, alignment, and spacing.
 - When making elements symmetrical, consider both their positions AND sizes relative to the slide center.
-- The slide center X is half the slide width. The slide center Y is half the slide height."""
+- The slide center X is half the slide width. The slide center Y is half the slide height.
+- For create_slide: choose a layout that fits the user's request. If they ask for a title slide, use "TITLE". If they want a slide with content, use "TITLE_AND_BODY". If they don't specify, use "BLANK".
+- You can combine create_slide with layout instructions in the same array (e.g. create a slide then move elements on the current slide).
+- When the user says "create a slide about X", generate appropriate title and body text for the topic.
+- For replace_text: this replaces ALL text in the element. Use it when the user wants to change what text says.
+- For update_text_style: this applies to ALL text in the element. Use it for font size, color, bold, italic, underline, font family changes.
+- You can combine update_text_style with replace_text on the same element (e.g. change text AND make it bold).
+- When the user says "make all text bigger" or "change font size", apply update_text_style to every text element on the slide."""
 
 
 def _ask_llm_for_instructions(
@@ -217,12 +264,96 @@ def _ask_llm_for_instructions(
         return []
 
 
-def _instructions_to_batch_requests(
-    instructions: list[dict], page_json: dict
+def _gen_id(prefix: str = "dex2") -> str:
+    """Generate a short unique objectId valid for Slides API (5-50 chars, alphanumeric/underscore start)."""
+    return f"{prefix}_{uuid.uuid4().hex[:8]}"
+
+
+def _resolve_insertion_index(insert_after, current_slide_index: Optional[int], total_slides: int) -> int:
+    """Compute the 0-based insertion index for a new slide."""
+    if insert_after == "end":
+        return total_slides
+    elif insert_after == "current" and current_slide_index is not None:
+        return current_slide_index + 1
+    elif isinstance(insert_after, (int, float)):
+        return int(insert_after)
+    return total_slides
+
+
+def _create_and_populate_slide(
+    inst: dict,
+    presentation_id: str,
+    access_token: str,
+    current_slide_index: Optional[int],
+    total_slides: int,
+) -> str:
+    """
+    Create a slide and populate its placeholders with text.
+    Uses two API calls: one to create the slide, one to read it back and insert text.
+    Returns a status message.
+    """
+    layout = inst.get("layout", "BLANK")
+    insertion_index = _resolve_insertion_index(
+        inst.get("insert_after", "current"), current_slide_index, total_slides
+    )
+    slide_id = _gen_id("slide")
+
+    create_req = {
+        "createSlide": {
+            "objectId": slide_id,
+            "insertionIndex": insertion_index,
+            "slideLayoutReference": {"predefinedLayout": layout},
+        }
+    }
+    execute_batch_update(presentation_id, [create_req], access_token)
+
+    title_text = inst.get("title", "")
+    body_text = inst.get("body", "")
+    if not title_text and not body_text:
+        return f"Created blank slide ({layout})"
+
+    page_json = get_slide_elements(presentation_id, slide_id, access_token)
+    text_requests = []
+    for el in page_json.get("pageElements", []):
+        ph = el.get("shape", {}).get("placeholder", {})
+        ph_type = ph.get("type", "")
+        obj_id = el.get("objectId")
+        if not obj_id:
+            continue
+        if ph_type in ("TITLE", "CENTERED_TITLE") and title_text:
+            text_requests.append({
+                "insertText": {"objectId": obj_id, "text": title_text, "insertionIndex": 0}
+            })
+        elif ph_type in ("BODY", "SUBTITLE") and body_text:
+            text_requests.append({
+                "insertText": {"objectId": obj_id, "text": body_text, "insertionIndex": 0}
+            })
+
+    if text_requests:
+        execute_batch_update(presentation_id, text_requests, access_token)
+
+    return f"Created slide ({layout}) with content"
+
+
+def _hex_to_rgb(hex_color: str) -> dict:
+    """Convert '#RRGGBB' to Slides API rgbColor (0.0-1.0 floats)."""
+    h = hex_color.lstrip("#")
+    if len(h) != 6:
+        return {"red": 0, "green": 0, "blue": 0}
+    return {
+        "red": int(h[0:2], 16) / 255.0,
+        "green": int(h[2:4], 16) / 255.0,
+        "blue": int(h[4:6], 16) / 255.0,
+    }
+
+
+def _edit_instructions_to_batch_requests(
+    instructions: list[dict], page_json: dict,
 ) -> list[dict]:
     """
-    Convert LLM layout instructions to Slides API batchUpdate requests.
-    Preserves existing transform values (scale, shear) for elements.
+    Convert LLM instructions (move/resize/replace_text/update_text_style)
+    to Slides API batchUpdate requests.
+    Skips create_slide instructions (handled separately).
     """
     el_map = {}
     for el in page_json.get("pageElements", []):
@@ -231,11 +362,78 @@ def _instructions_to_batch_requests(
     requests = []
     for inst in instructions:
         action = inst.get("action")
+
+        if action == "create_slide":
+            continue
+
         obj_id = inst.get("objectId")
         if not obj_id or obj_id not in el_map:
             continue
 
+        # Check if element has text before text operations
         el = el_map[obj_id]
+        has_text = bool(
+            el.get("shape", {}).get("text", {}).get("textElements")
+        )
+
+        if action == "replace_text":
+            new_text = inst.get("new_text", "")
+            if has_text:
+                requests.append({
+                    "deleteText": {
+                        "objectId": obj_id,
+                        "textRange": {"type": "ALL"},
+                    }
+                })
+            requests.append({
+                "insertText": {
+                    "objectId": obj_id,
+                    "text": new_text,
+                    "insertionIndex": 0,
+                }
+            })
+            continue
+
+        if action == "update_text_style":
+            if not has_text:
+                print(f"   SLIDES: skipping update_text_style for {obj_id} (no text)")
+                continue
+            style = {}
+            fields = []
+
+            if "font_size_pt" in inst:
+                style["fontSize"] = {"magnitude": inst["font_size_pt"], "unit": "PT"}
+                fields.append("fontSize")
+            if "bold" in inst:
+                style["bold"] = inst["bold"]
+                fields.append("bold")
+            if "italic" in inst:
+                style["italic"] = inst["italic"]
+                fields.append("italic")
+            if "underline" in inst:
+                style["underline"] = inst["underline"]
+                fields.append("underline")
+            if "font_family" in inst:
+                style["fontFamily"] = inst["font_family"]
+                fields.append("fontFamily")
+            if "color" in inst:
+                style["foregroundColor"] = {
+                    "opaqueColor": {"rgbColor": _hex_to_rgb(inst["color"])}
+                }
+                fields.append("foregroundColor")
+
+            if style and fields:
+                requests.append({
+                    "updateTextStyle": {
+                        "objectId": obj_id,
+                        "textRange": {"type": "ALL"},
+                        "style": style,
+                        "fields": ",".join(fields),
+                    }
+                })
+            continue
+
+        # Layout instructions (move / resize / move_and_resize)
         transform = el.get("transform", {})
         size = el.get("size", {})
 
@@ -340,6 +538,7 @@ def handle_edit_slides(
     try:
         page_width, page_height = get_page_size(presentation_id, access_token)
         page_json = get_slide_elements(presentation_id, page_id, access_token)
+        slide_list = get_slide_list(presentation_id, access_token)
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 401:
             return "Google token expired or missing Slides permission. Please Disconnect Google, then Connect Google again."
@@ -347,30 +546,75 @@ def handle_edit_slides(
     except Exception as e:
         return f"Error reading slide: {e}"
 
+    current_slide_index = None
+    for s in slide_list:
+        if s["objectId"] == page_id:
+            current_slide_index = s["index"]
+            break
+    total_slides = len(slide_list)
+
     slide_desc = _build_slide_description(page_json, page_width, page_height)
-    print(f"   SLIDES: Slide description:\n{slide_desc}")
+    pres_context = f"\nPresentation has {total_slides} slide(s). Current slide is index {current_slide_index} (0-based)."
+    full_desc = slide_desc + pres_context
+    print(f"   SLIDES: Slide description:\n{full_desc}")
 
     try:
-        instructions = _ask_llm_for_instructions(slide_desc, user_message)
+        instructions = _ask_llm_for_instructions(full_desc, user_message)
     except Exception as e:
         return f"Error getting layout instructions from LLM: {e}"
 
     if not instructions:
-        return "The AI couldn't determine any layout changes for this request. Try being more specific (e.g. 'center the two text boxes horizontally')."
+        return "The AI couldn't determine any changes for this request. Try being more specific (e.g. 'create a title slide about AI' or 'center the two text boxes')."
 
     print(f"   SLIDES: {len(instructions)} instructions from LLM")
 
-    update_requests = _instructions_to_batch_requests(instructions, page_json)
+    slides_created = 0
+    elements_updated = 0
 
-    if not update_requests:
-        return "No valid layout changes could be generated. The element IDs from the AI might not match the slide."
+    # Handle create_slide instructions first
+    create_instructions = [i for i in instructions if i.get("action") == "create_slide"]
+    for ci in create_instructions:
+        try:
+            result = _create_and_populate_slide(
+                ci, presentation_id, access_token, current_slide_index, total_slides,
+            )
+            print(f"   SLIDES: {result}")
+            slides_created += 1
+        except httpx.HTTPStatusError as e:
+            error_body = ""
+            try:
+                error_body = e.response.text[:300]
+            except Exception:
+                pass
+            print(f"   SLIDES: create_slide failed (HTTP {e.response.status_code}): {error_body}")
+            return f"Failed to create the slide (HTTP {e.response.status_code}). Error: {error_body}"
+        except Exception as e:
+            return f"Error creating slide: {e}"
 
-    try:
-        execute_batch_update(presentation_id, update_requests, access_token)
-    except httpx.HTTPStatusError as e:
-        return f"Failed to update the slide (HTTP {e.response.status_code}). Make sure the Slides API is enabled and you have edit access."
-    except Exception as e:
-        return f"Error updating slide: {e}"
+    # Handle edit instructions (move/resize/replace_text/update_text_style)
+    layout_requests = _edit_instructions_to_batch_requests(instructions, page_json)
+    if layout_requests:
+        try:
+            execute_batch_update(presentation_id, layout_requests, access_token)
+            elements_updated = len(layout_requests)
+        except httpx.HTTPStatusError as e:
+            error_body = ""
+            try:
+                error_body = e.response.text[:300]
+            except Exception:
+                pass
+            print(f"   SLIDES: edit requests failed (HTTP {e.response.status_code}): {error_body}")
+            return f"Failed to update elements (HTTP {e.response.status_code}). Make sure the Slides API is enabled and you have edit access."
+        except Exception as e:
+            return f"Error updating elements: {e}"
 
-    count = len(update_requests)
-    return f"Done! I updated {count} element{'s' if count != 1 else ''} on the slide. Refresh your Slides tab to see the changes."
+    if not slides_created and not elements_updated:
+        return "No valid changes could be generated. Try being more specific."
+
+    parts = []
+    if slides_created:
+        parts.append(f"created {slides_created} new slide{'s' if slides_created != 1 else ''}")
+    if elements_updated:
+        parts.append(f"updated {elements_updated} element{'s' if elements_updated != 1 else ''}")
+    summary = " and ".join(parts)
+    return f"Done! I {summary}. Refresh your Slides tab to see the changes."
