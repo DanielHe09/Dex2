@@ -53,6 +53,24 @@ Chat uses RAG plus a single-round tool-calling flow:
 
 4. **Respond** – The API returns `ChatResponse`: `action` (`chat_only`, `open_tab`, `send_email`, or `edit_slides`), `msg`, and optionally `email_url`. The frontend displays `msg` and, depending on `action`, opens a tab from `msg`, opens Gmail compose with `email_url`, handles edit_slides (e.g. show result or open Slides), or shows the message only.
 
+### Google Slides editing
+
+When the user is on a Google Slides tab and asks to modify or query the presentation, the main agent can call the **edit_slides** tool. The backend then runs the slides pipeline in `backend/slides/`:
+
+1. **Entry** – `handle_edit_slides(current_tab_url, user_message, access_token)` requires a valid Google access token (from Connect Google) and a tab URL that is a Google Slides presentation with a slide fragment (e.g. `#slide=id.xxx`). If the token or URL is missing or invalid, it returns a short error message instead of calling the API.
+
+2. **Fetch** – The presentation ID and current slide ID are parsed from the URL. The Google Slides API is used to fetch the full presentation (layout, page size, all slides and elements). The current slide’s elements and free space are computed for context.
+
+3. **Router** – An LLM (same GPT-4o-mini) classifies the user request into one operation type: `answer_question` (Q&A about the deck), `edit_layout` (move, resize, align, center, make symmetrical), `create_content` (add shapes, text boxes, lines on the current slide), `create_slide` (add a new blank slide), or `edit_text` (change text content, font, size, color). The router uses a short context (slide count, title, current slide index, dimensions, element count, free space) so it stays fast.
+
+4. **Executor** – A second LLM call runs the operation-specific prompt (e.g. edit layout, create content, edit text) with full presentation and current-slide context. The model outputs structured instructions (create/update/delete elements with positions, sizes, text, style). For `answer_question`, the executor returns a direct answer and no instructions.
+
+5. **Apply** – For non–answer_question operations, `apply_instructions` translates the instructions into Google Slides API batch updates (create shapes, insert text, update transforms and style). For `create_slide`, the backend first creates a blank slide at the requested index, then applies the generated content to that slide. Success and error messages are returned as plain text.
+
+6. **Response** – The orchestrator returns a string (e.g. "Done! I added 2 elements and updated 1 element. Refresh your Slides tab to see the changes." or an error). The main chat endpoint puts this in `msg` and sets `action: "edit_slides"` so the frontend can show it.
+
+Slides code lives under `backend/slides/`: `orchestrator.py` (entry and flow), `router.py` (routing), `executors.py` (operation prompts and LLM calls), `actions.py` (apply_instructions and API calls), `api.py` (Slides API helpers and batch updates), `context.py` (presentation and style context).
+
 ### API endpoints
 
 | Method | Path | Description |
@@ -89,9 +107,11 @@ After each chat response, the frontend reads `action`, `msg`, and optionally `em
 
 - Node 18+. Install: `npm install`. Env: `frontend/.env` with `VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY`, and `VITE_GOOGLE_CLIENT_ID` (for Connect Google). Build: `npm run build`. Load the **built** extension from `frontend/dist` in Chrome (chrome://extensions, "Load unpacked", select `dist`). The backend must be running (e.g. http://localhost:8000) and the extension's API_URL in the background script must match.
 
-### Google Sheets/Docs
+### Google Sheets, Docs, and Slides
 
 To embed content from Google Sheets or Docs, the user clicks "Connect Google" in the popup and completes OAuth (Web application client; redirect URI `https://<extension-id>.chromiumapp.org/`). The backend then uses the user's access token with the Sheets and Docs APIs to extract text when the screenshot URL is a Google Sheets or Docs link. Without Connect Google, those URLs return 401 and are not embedded.
+
+The same Google token is sent with chat requests (header `X-Google-Access-Token`) so that when the user is on a Google Slides tab and asks to edit the presentation, the **edit_slides** tool can call the Google Slides API (fetch presentation, route the request, run the executor, and apply batch updates). Slides editing requires the tab URL to point to a presentation with a slide fragment (e.g. `#slide=id.xxx`). Google Slides presentation URLs are not used for screenshot text extraction (they typically return 401); only the edit_slides flow uses the Slides API.
 
 ---
 
