@@ -265,33 +265,40 @@ DEFAULT_BORDER_WEIGHT_PT = 1
 def normalize_instructions_style(
     instructions: list[dict],
     style_values: dict,
+    fill_missing_only: bool = False,
 ) -> list[dict]:
     """
     Force text color, font, fill, and outline on every create_shape to match the deck
-    (or fallbacks) before batch update. Ensures consistency even when the LLM output differs.
+    (or fallbacks) before batch update. When fill_missing_only is True, only set a field
+    if the instruction does not already have it (preserves vision-generated style).
     """
     primary_font = style_values.get("primary_font") or DEFAULT_FONT
     primary_text_color = style_values.get("primary_text_color") or DEFAULT_TEXT_COLOR
     bg_fills = style_values.get("primary_background_fills") or [DEFAULT_FILL]
     border_colors = style_values.get("primary_border_colors") or [DEFAULT_BORDER_COLOR]
 
-    print(f"   NORMALIZE_STYLE: forcing font={primary_font!r} text_color={primary_text_color!r} fill={bg_fills[0]!r} border={border_colors[0]!r}")
+    print(f"   NORMALIZE_STYLE: forcing font={primary_font!r} text_color={primary_text_color!r} fill={bg_fills[0]!r} border={border_colors[0]!r} (fill_missing_only={fill_missing_only})")
 
     out = []
     for i, inst in enumerate(instructions):
         inst = dict(inst)
         if inst.get("action") == "create_shape":
-            inst["color"] = primary_text_color
-            inst["font_family"] = primary_font
+            if not fill_missing_only or inst.get("color") is None:
+                inst["color"] = primary_text_color
+            if not fill_missing_only or inst.get("font_family") is None:
+                inst["font_family"] = primary_font
             role = (inst.get("role") or "").lower()
-            if role == "title" and len(bg_fills) >= 1:
-                inst["background_color"] = bg_fills[0]
-            elif "item" in role and len(bg_fills) >= 2:
-                inst["background_color"] = bg_fills[1]
-            else:
-                inst["background_color"] = bg_fills[0]
-            inst["border_color"] = border_colors[0]
-            inst["border_weight_pt"] = inst.get("border_weight_pt") if inst.get("border_weight_pt") is not None else DEFAULT_BORDER_WEIGHT_PT
+            if not fill_missing_only or inst.get("background_color") is None:
+                if role == "title" and len(bg_fills) >= 1:
+                    inst["background_color"] = bg_fills[0]
+                elif "item" in role and len(bg_fills) >= 2:
+                    inst["background_color"] = bg_fills[1]
+                else:
+                    inst["background_color"] = bg_fills[0]
+            if not fill_missing_only or inst.get("border_color") is None:
+                inst["border_color"] = border_colors[0]
+            if inst.get("border_weight_pt") is None:
+                inst["border_weight_pt"] = DEFAULT_BORDER_WEIGHT_PT
             print(f"   NORMALIZE_STYLE: create_shape[{i}] role={role!r} -> color={inst['color']!r} font_family={inst['font_family']!r} bg={inst['background_color']!r} border={inst['border_color']!r}")
         out.append(inst)
     return out

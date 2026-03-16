@@ -52,6 +52,7 @@ MUST GET RIGHT (use exact values from "Presentation visual style" and element li
 
 Rules:
 - ALWAYS include "text" with actual content when user asks to add a section/content about something.
+- When the user asks to add a section/column/card "in the empty space", "next to 2", or "that matches the others", follow the "Current slide visual style" section/column instructions exactly: create an outer RECTANGLE (section_background_fill, section_border_color), then a number label, then a title TEXT_BOX (title_text_color, bold), then a body TEXT_BOX (inner_text_box_fill, inner_text_box_border, body text color). Place and size the new block to align with existing columns and fill the gap.
 - For numbered lists or "N things" / "N items" slides, PREFER role-based create_shape (title, item_1_number, item_1_text, item_2_number, item_2_text, ...) so number and text boxes align and do not overlap.
 - Use ONLY hex values from the presentation style and element list for background_color, color, and border_color. Use shape_type TEXT_BOX or RECTANGLE (or ROUND_RECTANGLE if the deck uses rounded corners).
 - Use RECTANGLE or ROUND_RECTANGLE with background_color for card-style sections.

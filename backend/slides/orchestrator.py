@@ -91,11 +91,30 @@ def handle_edit_slides(
         _, llm_message, _ = call_executor(ANSWER_QUESTION_PROMPT, full_desc, user_message)
         return llm_message or "I couldn't find an answer. Try rephrasing your question."
 
+    # When adding new elements (create_content) with screenshot, Gemini can generate instructions from the image (placement + style). Otherwise we use GPT executor.
+    precomputed_style_values: Optional[dict] = None
+    content_from_gemini = False  # if True, normalize only fills missing style fields so Gemini's style is preserved
     if operation == "edit_layout":
         instructions, llm_message, _ = call_executor(EDIT_LAYOUT_PROMPT, full_desc, user_message)
 
     elif operation == "create_content":
-        instructions, llm_message, _ = call_executor(CREATE_CONTENT_PROMPT, full_desc, user_message)
+        if slide_screenshot:
+            # Gemini analyzes the screenshot and produces instructions (placement + style). Pass full_desc so Gemini knows FREE SPACE gaps and element positions.
+            instructions, llm_message = vision_style.generate_content_instructions_from_image(
+                slide_screenshot, user_message, page_w_pt, page_h_pt, layout_context=full_desc
+            )
+            precomputed_style_values = vision_style.extract_style_from_slide_image(slide_screenshot)
+            if instructions:
+                content_from_gemini = True
+            elif precomputed_style_values:
+                # Fallback to GPT executor if Gemini returned nothing
+                style_blurb = vision_style.format_style_for_prompt(precomputed_style_values)
+                create_ctx = f"{full_desc}\n\n{style_blurb}"
+                instructions, llm_message, _ = call_executor(CREATE_CONTENT_PROMPT, create_ctx, user_message)
+            else:
+                instructions, llm_message, _ = call_executor(CREATE_CONTENT_PROMPT, full_desc, user_message)
+        else:
+            instructions, llm_message, _ = call_executor(CREATE_CONTENT_PROMPT, full_desc, user_message)
 
     elif operation == "create_slide":
         return _handle_create_slide(
@@ -121,13 +140,14 @@ def handle_edit_slides(
     print(f"   SLIDES: {len(instructions)} instructions from executor")
 
     instructions = prepare_instructions_for_apply(instructions, page_w_pt, page_h_pt)
-    if slide_screenshot:
-        style_values = vision_style.extract_style_from_slide_image(slide_screenshot) or {}
-        if not style_values:
-            style_values = get_presentation_style_values(presentation, presentation_id, access_token)
+    # Use vision style when create_content had screenshot; otherwise API-based style. If Gemini generated content, only fill missing style fields.
+    if precomputed_style_values is not None:
+        style_values = precomputed_style_values
     else:
         style_values = get_presentation_style_values(presentation, presentation_id, access_token)
-    instructions = normalize_instructions_style(instructions, style_values)
+    instructions = normalize_instructions_style(
+        instructions, style_values, fill_missing_only=content_from_gemini
+    )
 
     sc, eu, err = apply_instructions(
         instructions, presentation_id, page_id, page_json, access_token,
@@ -162,6 +182,10 @@ def _handle_create_slide(
     """Handle the create_slide operation: create BLANK slide, populate with styled shapes."""
     style_info = extract_presentation_style(presentation)
     slide_context = f"{full_desc}\n\n{style_info}\n\nNew slide dimensions: {page_w_pt} x {page_h_pt} PT"
+    if slide_screenshot:
+        vision_style_values = vision_style.extract_style_from_slide_image(slide_screenshot)
+        if vision_style_values:
+            slide_context = f"{slide_context}\n\n{vision_style.format_style_for_prompt(vision_style_values)}"
     instructions, llm_message, raw_parsed = call_executor(
         CREATE_SLIDE_PROMPT, slide_context, user_message
     )
