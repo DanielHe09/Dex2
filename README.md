@@ -4,7 +4,7 @@ Dex2 is a Chrome extension plus FastAPI backend. The extension captures screensh
 
 ## Architecture
 
-![Dex2 architecture diagram](diagram-export-2026-02-22-12_17_41-PM.png)
+![Dex2 architecture diagram](new-diagram.png)
 
 ### Demo
 
