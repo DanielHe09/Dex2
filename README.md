@@ -8,7 +8,8 @@ Dex2 is a Chrome extension plus FastAPI backend. The extension captures screensh
 
 ### Demo
 
-[Watch the demo](https://www.youtube.com/watch?v=fhYGrfLmNnQ)
+- [General Dex2 demo](https://www.youtube.com/watch?v=fhYGrfLmNnQ)
+- [Google Slides agent demo](https://youtu.be/M5DTKy1nb0I) - chat-driven slide edits (**edit_slides** tool)
 
 ---
 
