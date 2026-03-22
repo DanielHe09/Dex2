@@ -279,9 +279,8 @@ def expand_sliver_empty_text_boxes(
                     f"height {h:.1f} -> {new_h:.1f} pt (whitespace strip -> usable area)"
                 )
                 inst["height_pt"] = round(new_h, 1)
-            if w < content_w * 0.88:
-                inst["width_pt"] = round(max(w, content_w * 0.9), 1)
-                inst["x_pt"] = round(MARGIN_PT, 1)
+            # Do NOT change x_pt / width_pt here — forcing full-bleed width breaks alignment
+            # with column grids below and overrides model/vision border choices.
         out.append(inst)
     return out
 
@@ -330,7 +329,18 @@ def normalize_instructions_style(
     bg_fills = style_values.get("primary_background_fills") or [DEFAULT_FILL]
     border_colors = style_values.get("primary_border_colors") or [DEFAULT_BORDER_COLOR]
 
-    print(f"   NORMALIZE_STYLE: forcing font={primary_font!r} text_color={primary_text_color!r} fill={bg_fills[0]!r} border={border_colors[0]!r} (fill_missing_only={fill_missing_only})")
+    if fill_missing_only:
+        print(
+            f"   NORMALIZE_STYLE: fill_missing_only=True — bundle for gaps only: "
+            f"font={primary_font!r} text={primary_text_color!r} fill={bg_fills[0]!r} "
+            f"border_fallback={border_colors[0]!r} "
+            f"(instruction keeps border/font/color if already set; see per-shape line)"
+        )
+    else:
+        print(
+            f"   NORMALIZE_STYLE: forcing every field from bundle: font={primary_font!r} "
+            f"text_color={primary_text_color!r} fill={bg_fills[0]!r} border={border_colors[0]!r}"
+        )
 
     out = []
     for i, inst in enumerate(instructions):
