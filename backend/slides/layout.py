@@ -15,6 +15,11 @@ ROW_HEIGHT_PT = 56
 NUMBER_BOX_WIDTH_PT = 40
 NUMBER_TEXT_GAP_PT = 12
 MIN_TEXT_BOX_HEIGHT_PT = 32
+# Empty "horizontal" text boxes in whitespace often come back ~10–24pt tall; expand those.
+MIN_USABLE_EMPTY_HORIZONTAL_TEXT_BOX_HEIGHT_PT = 72
+MAX_USABLE_EMPTY_HORIZONTAL_TEXT_BOX_HEIGHT_PT = 120
+WIDE_EMPTY_TEXT_BOX_MIN_WIDTH_RATIO = 0.4  # of content width
+SLIVER_MAX_HEIGHT_PT = 52  # if wider than ratio and shorter than this, expand
 SMALL_AREA_THRESHOLD_PT2 = 4000  # below this = likely number box
 OVERLAP_GAP_PT = 8
 
@@ -234,6 +239,53 @@ def compute_layout_from_roles(
     return instructions
 
 
+def expand_sliver_empty_text_boxes(
+    instructions: list[dict],
+    page_width_pt: float,
+    page_height_pt: float,
+) -> list[dict]:
+    """
+    Widen/tall-en empty TEXT_BOX shapes that are wide but extremely short (vision/GPT
+    often returns a 1-line-height box for "empty text box in whitespace").
+    """
+    content_w = page_width_pt - 2 * MARGIN_PT
+    out: list[dict] = []
+    for inst in instructions:
+        inst = dict(inst)
+        if inst.get("action") != "create_shape":
+            out.append(inst)
+            continue
+        st = (inst.get("shape_type") or "TEXT_BOX").upper()
+        if st != "TEXT_BOX":
+            out.append(inst)
+            continue
+        if (inst.get("text") or "").strip():
+            out.append(inst)
+            continue
+        x = float(inst.get("x_pt") or 0)
+        y = float(inst.get("y_pt") or 0)
+        w = float(inst.get("width_pt") or 0)
+        h = float(inst.get("height_pt") or 0)
+        if w >= content_w * WIDE_EMPTY_TEXT_BOX_MIN_WIDTH_RATIO and h <= SLIVER_MAX_HEIGHT_PT:
+            room_below = page_height_pt - y - MARGIN_PT
+            target_h = max(
+                MIN_USABLE_EMPTY_HORIZONTAL_TEXT_BOX_HEIGHT_PT,
+                min(MAX_USABLE_EMPTY_HORIZONTAL_TEXT_BOX_HEIGHT_PT, room_below * 0.78),
+            )
+            new_h = min(target_h, max(MIN_TEXT_BOX_HEIGHT_PT, room_below - 4))
+            if new_h > h:
+                print(
+                    f"   LAYOUT: expanded empty horizontal TEXT_BOX "
+                    f"height {h:.1f} -> {new_h:.1f} pt (whitespace strip -> usable area)"
+                )
+                inst["height_pt"] = round(new_h, 1)
+            if w < content_w * 0.88:
+                inst["width_pt"] = round(max(w, content_w * 0.9), 1)
+                inst["x_pt"] = round(MARGIN_PT, 1)
+        out.append(inst)
+    return out
+
+
 def prepare_instructions_for_apply(
     instructions: list[dict],
     page_width_pt: float,
@@ -251,7 +303,8 @@ def prepare_instructions_for_apply(
     if has_roles:
         instructions = compute_layout_from_roles(instructions, page_width_pt, page_height_pt)
 
-    return fix_layout(instructions, page_width_pt, page_height_pt)
+    fixed = fix_layout(instructions, page_width_pt, page_height_pt)
+    return expand_sliver_empty_text_boxes(fixed, page_width_pt, page_height_pt)
 
 
 # Fallbacks when the deck has no style data (force consistent black text, Arial, white fill, black border)

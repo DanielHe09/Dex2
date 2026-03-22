@@ -59,6 +59,7 @@ Rules:
 - Use RECTANGLE or ROUND_RECTANGLE with background_color for card-style sections.
 - When using coordinates (no role), a new element at y=Y with height=H MUST fit within a free-space gap: Y >= gap_start AND Y + H <= gap_end.
 - If content doesn't fit, SHRINK height or font size to fit within the gap.
+- **Horizontal empty TEXT_BOX in whitespace** (e.g. under a title like "Conclusion", between header and columns): the box must be **usable**, not a 1-line sliver. Use **width_pt** ≈ slide content width (slide width minus ~72pt margins on each side). Use **height_pt** at least **72–120pt**—or about **65–85% of the FREE SPACE gap height** for that region (use the GAP lines: if the gap is y=80–240 with height 160pt, prefer height_pt around 100–136). Never output height_pt under **48** for an empty body box meant for future text.
 - You can also move/resize existing elements to make room: {"action": "move"|"resize"|"move_and_resize", "objectId": "...", ...}
 - No markdown fences. Output ONLY the JSON object."""
 
