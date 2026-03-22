@@ -25,6 +25,8 @@ Rules:
 - "change the font to Arial", "make text bigger", "replace the title text", "change the background/fill color", "match the colors", "change colors of text boxes" → edit_text
 - "what font is on slide 2?", "what does slide 5 say?" → answer_question
 - If the current slide has NO free space and the user wants to add substantial content, use "create_slide"
+- EMPTY TEXT BOXES on slide (see context): If the context lists empty text boxes and the user wants wording inside a box (e.g. conclusion, sentences, paragraph, bullets, "fill it", "textbox with ...", "put the text in the box") WITHOUT clearly asking for an ADDITIONAL separate box, use "edit_text" so the model can replace_text on an existing objectId. Do NOT use "create_content" for that — it stacks a duplicate box on top.
+- If the user clearly wants ANOTHER / NEW / SECOND / DUPLICATE text box in addition to existing ones (e.g. "add a new empty text box", "another text box on the right"), use "create_content".
 - Output ONLY the JSON object, no markdown."""
 
 
@@ -32,8 +34,9 @@ def build_router_context(
     total_slides: int, title: str, current_index: Optional[int],
     page_w_pt: float, page_h_pt: float, num_elements: int,
     gaps: list[tuple[float, float, float]],
+    empty_text_boxes_hint: Optional[str] = None,
 ) -> str:
-    """Build a short context string for the router (no element details)."""
+    """Build a short context string for the router (no full element list)."""
     lines = [
         f'Presentation: "{title}" ({total_slides} slides)',
         f"Current slide: index {current_index}, {page_w_pt}x{page_h_pt} PT, {num_elements} elements",
@@ -43,6 +46,8 @@ def build_router_context(
         lines.append(f"Free vertical space: {', '.join(gap_strs)}")
     else:
         lines.append("Free vertical space: NONE (slide is full)")
+    if empty_text_boxes_hint:
+        lines.append(empty_text_boxes_hint)
     return "\n".join(lines)
 
 

@@ -2,6 +2,7 @@
 Main entry point: two-step router → executor orchestration for Google Slides editing.
 """
 
+import re
 from typing import Optional
 
 import httpx
@@ -12,8 +13,10 @@ from .api import (
     resolve_insertion_index,
 )
 from .context import (
-    build_full_presentation_context, extract_presentation_style,
+    build_full_presentation_context,
+    extract_presentation_style,
     get_presentation_style_values,
+    list_empty_text_box_summaries,
 )
 from . import vision_style
 from .router import build_router_context, route_request
@@ -23,6 +26,47 @@ from .executors import (
 )
 from .actions import apply_instructions
 from .layout import prepare_instructions_for_apply, normalize_instructions_style
+
+
+def _format_empty_text_boxes_router_hint(page_json: dict) -> Optional[str]:
+    boxes = list_empty_text_box_summaries(page_json)
+    if not boxes:
+        return None
+    lines = [
+        f"Empty text boxes on this slide ({len(boxes)}): shapes with no visible text — "
+        "prefer operation edit_text (replace_text with objectId) to fill them, not create_content.",
+    ]
+    for s in boxes[:8]:
+        lines.append(f'  - objectId "{s["objectId"]}" at ({s["x_pt"]}, {s["y_pt"]}) PT')
+    return "\n".join(lines)
+
+
+def _force_edit_text_to_fill_empty_text_box(user_message: str, page_json: dict) -> bool:
+    """
+    When the slide already has an empty TEXT_BOX and the user phrasing means
+    'put content in a box' (not 'add another new box'), skip create_content.
+    """
+    if not list_empty_text_box_summaries(page_json):
+        return False
+    msg = user_message.lower()
+    # "add a new text box WITH …" still means put content in a box — prefer fill when empty exists
+    if re.search(r"\btext\s*box\s+with\b", msg):
+        return True
+    # Explicitly asking for an additional empty/new box (no "with [content]" phrasing)
+    if re.search(r"\badd\s+a\s+new\b.*\btext\s*box\b", msg):
+        return False
+    if re.search(r"\bnew\s+[\w\s]{0,40}text\s*box\b", msg) and "with" not in msg:
+        return False
+    if re.search(r"\b(another|second|duplicate|extra)\s+[\w\s]{0,20}text\s*box\b", msg):
+        return False
+    # Typical 'fill the box with content' phrasing
+    if re.search(r"\bfill\s+the\s+(empty\s+)?text\s*box\b", msg):
+        return True
+    if re.search(r"\bput\s+.+\s+in\s+(the|that)\s+text\s*box\b", msg):
+        return True
+    if re.search(r"\b(in|into)\s+that\s+text\s*box\b", msg):
+        return True
+    return False
 
 
 def handle_edit_slides(
@@ -72,16 +116,28 @@ def handle_edit_slides(
         return "I can't find the current slide in the presentation. Try clicking on the slide and sending your request again."
 
     # --- STEP 1: ROUTE ---
+    empty_hint = _format_empty_text_boxes_router_hint(page_json)
     router_ctx = build_router_context(
-        total_slides, presentation.get("title", "Untitled"),
-        current_slide_index, page_w_pt, page_h_pt, num_elements, gaps,
+        total_slides,
+        presentation.get("title", "Untitled"),
+        current_slide_index,
+        page_w_pt,
+        page_h_pt,
+        num_elements,
+        gaps,
+        empty_text_boxes_hint=empty_hint,
     )
-    try:
-        operation, route_msg = route_request(router_ctx, user_message)
-    except Exception as e:
-        print(f"   ROUTER error: {e}, falling back to edit_layout")
-        operation = "edit_layout"
-        route_msg = ""
+    if _force_edit_text_to_fill_empty_text_box(user_message, page_json):
+        operation = "edit_text"
+        route_msg = "heuristic: fill existing empty text box"
+        print(f"   ROUTER override: {operation} ({route_msg})")
+    else:
+        try:
+            operation, route_msg = route_request(router_ctx, user_message)
+        except Exception as e:
+            print(f"   ROUTER error: {e}, falling back to edit_layout")
+            operation = "edit_layout"
+            route_msg = ""
 
     print(f"   ROUTED to: {operation} ({route_msg})")
 
@@ -150,7 +206,12 @@ def handle_edit_slides(
     )
 
     sc, eu, err = apply_instructions(
-        instructions, presentation_id, page_id, page_json, access_token,
+        instructions,
+        presentation_id,
+        page_id,
+        page_json,
+        access_token,
+        text_style_fallback=style_values,
     )
     if err:
         return err
@@ -182,6 +243,9 @@ def _handle_create_slide(
     """Handle the create_slide operation: create BLANK slide, populate with styled shapes."""
     style_info = extract_presentation_style(presentation)
     slide_context = f"{full_desc}\n\n{style_info}\n\nNew slide dimensions: {page_w_pt} x {page_h_pt} PT"
+    # One vision call per request — calling Gemini twice on the same screenshot yields
+    # different fonts/colors and overwrites the executor's choices inconsistently.
+    vision_style_values: Optional[dict] = None
     if slide_screenshot:
         vision_style_values = vision_style.extract_style_from_slide_image(slide_screenshot)
         if vision_style_values:
@@ -213,7 +277,7 @@ def _handle_create_slide(
 
     instructions = prepare_instructions_for_apply(instructions, page_w_pt, page_h_pt)
     if slide_screenshot:
-        style_values = vision_style.extract_style_from_slide_image(slide_screenshot) or {}
+        style_values = dict(vision_style_values) if vision_style_values else {}
         if not style_values:
             style_values = get_presentation_style_values(presentation, presentation_id, access_token)
     else:
@@ -221,7 +285,12 @@ def _handle_create_slide(
     instructions = normalize_instructions_style(instructions, style_values)
     empty_page = {"pageElements": []}
     sc, _, err = apply_instructions(
-        instructions, presentation_id, slide_id, empty_page, access_token,
+        instructions,
+        presentation_id,
+        slide_id,
+        empty_page,
+        access_token,
+        text_style_fallback=style_values,
     )
     if err:
         return err

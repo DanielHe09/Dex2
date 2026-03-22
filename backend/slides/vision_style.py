@@ -178,11 +178,12 @@ Your task: Output a JSON object with instructions to ADD the requested content s
 {{"instructions": [...], "message": "brief summary"}}
 
 Instructions:
-- Each new element must be a create_shape: {{"action": "create_shape", "shape_type": "TEXT_BOX" or "RECTANGLE", "x_pt": number, "y_pt": number, "width_pt": number, "height_pt": number, "text": "..." (for TEXT_BOX), "background_color": "#hex", "border_color": "#hex", "border_weight_pt": 1, "font_family": "...", "color": "#hex", "font_size_pt": number, "bold": true/false}}
+- If the layout context lists *** EMPTY TEXT BOXES *** and the user wants to put wording inside a box (conclusion, sentences, paragraph, fill the box, etc.) and is NOT clearly asking for an extra brand-new box, output ONLY replace_text instructions: {{"action": "replace_text", "objectId": "<exact id from layout>", "new_text": "..."}}. Optionally add update_text_style on the same objectId to match font size/color. Do NOT create_shape a new TEXT_BOX on top — that stacks duplicates.
+- Each new element must otherwise be a create_shape: {{"action": "create_shape", "shape_type": "TEXT_BOX" or "RECTANGLE", "x_pt": number, "y_pt": number, "width_pt": number, "height_pt": number, "text": "..." (for TEXT_BOX), "background_color": "#hex", "border_color": "#hex", "border_weight_pt": 1, "font_family": "...", "color": "#hex", "font_size_pt": number, "bold": true/false}}
 - You MUST include x_pt, y_pt, width_pt, height_pt for every create_shape. Use the FREE SPACE / GAP and Elements list above to place new content in the actual empty region (e.g. to the right of the rightmost column). Match the x_pt of the new column to align with where the empty space starts; match y_pt and height to existing columns so the new section lines up.
 - Match the EXACT visual style you see in the image: same background_color, border_color, font_family, and text color as the existing similar elements.
 - When adding a new section/column that should match existing ones (e.g. "3" next to "1" and "2"): create 1) an outer RECTANGLE for the section, 2) a small TEXT_BOX for the number label (e.g. "3"), 3) a TEXT_BOX for the section title, 4) a TEXT_BOX for the body text. Position them using the coordinates from the layout context so the new column sits in the empty space and aligns with existing columns.
-- Do not create move/resize instructions for existing elements unless the user asked to move something. Only create new shapes.
+- Do not create move/resize instructions for existing elements unless the user asked to move something. Only create new shapes when replace_text is not the right approach.
 Output only the JSON object, nothing else."""
 
 

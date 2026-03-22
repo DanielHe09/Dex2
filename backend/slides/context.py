@@ -124,6 +124,25 @@ def _summarize_element(el: dict) -> Optional[dict]:
     return summary
 
 
+def list_empty_text_box_summaries(page_json: dict) -> list[dict]:
+    """
+    Text-box shapes with no visible text (whitespace-only counts as empty).
+    Used to route edit_text / replace_text instead of stacking duplicate create_shape boxes.
+    """
+    summaries: list[dict] = []
+    for el in page_json.get("pageElements", []):
+        s = _summarize_element(el)
+        if not s:
+            continue
+        if s.get("type") != "text_box":
+            continue
+        txt = (s.get("text") or "").strip()
+        if txt:
+            continue
+        summaries.append(s)
+    return summaries
+
+
 def _compute_free_gaps(
     summaries: list[dict], page_h_pt: float
 ) -> list[tuple[float, float, float]]:
@@ -188,6 +207,19 @@ def build_slide_description(
         if s.get("style"):
             desc += f', style: [{s["style"]}]'
         lines.append(desc)
+
+    empty_boxes = [s for s in summaries if s.get("type") == "text_box" and not (s.get("text") or "").strip()]
+    if empty_boxes:
+        lines.append("")
+        lines.append(
+            "*** EMPTY TEXT BOXES — no visible text. Prefer {\"action\": \"replace_text\", \"objectId\": \"...\", \"new_text\": \"...\"} "
+            "to fill one of these; do NOT create_shape a new TEXT_BOX on top (causes stacked duplicates). ***"
+        )
+        for s in empty_boxes:
+            lines.append(
+                f'  - objectId: "{s["objectId"]}", position: ({s["x_pt"]}, {s["y_pt"]}) PT, '
+                f'size: {s["width_pt"]} x {s["height_pt"]} PT'
+            )
 
     return "\n".join(lines), gaps, len(summaries)
 

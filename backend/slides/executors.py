@@ -51,7 +51,8 @@ MUST GET RIGHT (use exact values from "Presentation visual style" and element li
 4. Text box outline: Set "border_color" from Common border/outline colors or from element list (border: #hex). Set "border_weight_pt" (e.g. 1–2) when existing slides show a visible outline (see element list border_weight). If boxes on existing slides have a border, copy that.
 
 Rules:
-- ALWAYS include "text" with actual content when user asks to add a section/content about something.
+- If the slide description includes *** EMPTY TEXT BOXES *** and the user wants text inside a box (conclusion, sentences, fill the box, "textbox with ...") without clearly asking for an ADDITIONAL new box, use replace_text with the correct objectId — do NOT create_shape a duplicate TEXT_BOX on top.
+- ALWAYS include "text" with actual content when user asks to add a section/content about something (unless you are only using replace_text to fill an empty box as above).
 - When the user asks to add a section/column/card "in the empty space", "next to 2", or "that matches the others", follow the "Current slide visual style" section/column instructions exactly: create an outer RECTANGLE (section_background_fill, section_border_color), then a number label, then a title TEXT_BOX (title_text_color, bold), then a body TEXT_BOX (inner_text_box_fill, inner_text_box_border, body text color). Place and size the new block to align with existing columns and fill the gap.
 - For numbered lists or "N things" / "N items" slides, PREFER role-based create_shape (title, item_1_number, item_1_text, item_2_number, item_2_text, ...) so number and text boxes align and do not overlap.
 - Use ONLY hex values from the presentation style and element list for background_color, color, and border_color. Use shape_type TEXT_BOX or RECTANGLE (or ROUND_RECTANGLE if the deck uses rounded corners).
@@ -112,6 +113,7 @@ Update text style: {"action": "update_text_style", "objectId": "...", "font_size
 Update shape fill/background (for text boxes and shapes): {"action": "update_shape_fill", "objectId": "...", "background_color": "#hex", "border_color": "#hex", "border_weight_pt": number (optional, omit or use 0 for no border)}
 
 Rules:
+- If *** EMPTY TEXT BOXES *** are listed and the user wants body copy, a conclusion, bullets, or sentences in "the" / "that" text box, use replace_text on one of those objectIds (pick the empty box that matches the user's intent by position/size). Do not create_shape a new text box on top of an empty one.
 - replace_text replaces ALL text in the element.
 - update_text_style applies to ALL text in the element (color = text color).
 - update_shape_fill changes the shape's background fill and/or border. Use when the user says "change the background/fill color", "match the colors", "make these boxes the same color as the rest of the slideshow". Use hex values from the slide's existing elements (style and bg: in the element list) or from "Common background fills" / "Common text colors" in the presentation style.

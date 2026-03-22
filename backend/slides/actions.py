@@ -2,7 +2,7 @@
 Translate LLM instructions into Google Slides API requests and execute them.
 """
 
-from typing import Optional
+from typing import Any, Optional
 
 import httpx
 
@@ -187,8 +187,121 @@ def create_line(
     return f"Created {line_type.lower()} line from ({start_x}, {start_y}) to ({end_x}, {end_y})"
 
 
+def _rgb_fraction_dict_to_hex(rgb: dict) -> Optional[str]:
+    if not rgb:
+        return None
+    r_val = int(rgb.get("red", 0) * 255)
+    g_val = int(rgb.get("green", 0) * 255)
+    b_val = int(rgb.get("blue", 0) * 255)
+    return f"#{r_val:02x}{g_val:02x}{b_val:02x}"
+
+
+def _style_dict_from_slides_text_run(style: dict) -> dict[str, Any]:
+    """Map Slides API textRun.style to flat fields for updateTextStyle."""
+    out: dict[str, Any] = {}
+    if not style:
+        return out
+    ff = style.get("fontFamily") or style.get("weightedFontFamily", {}).get("fontFamily")
+    if ff:
+        out["font_family"] = ff
+    fs = style.get("fontSize", {})
+    mag = fs.get("magnitude")
+    if mag is not None:
+        unit = (fs.get("unit") or "PT").upper()
+        if unit == "PT":
+            out["font_size_pt"] = float(mag)
+    if "bold" in style:
+        out["bold"] = bool(style["bold"])
+    if "italic" in style:
+        out["italic"] = bool(style["italic"])
+    fg = style.get("foregroundColor", {}).get("opaqueColor", {}).get("rgbColor", {})
+    hx = _rgb_fraction_dict_to_hex(fg)
+    if hx:
+        out["color"] = hx
+    return out
+
+
+def infer_body_text_style_from_page(
+    page_json: dict,
+    exclude_object_ids: Optional[set[str]] = None,
+) -> Optional[dict[str, Any]]:
+    """
+    Infer font/color/size from the shape on this slide with the most body-like text
+    (longest non-trivial text), excluding given objectIds (e.g. the box being filled).
+    """
+    exclude_object_ids = exclude_object_ids or set()
+    best: Optional[dict[str, Any]] = None
+    best_chars = 0
+    for el in page_json.get("pageElements", []):
+        oid = el.get("objectId")
+        if not oid or oid in exclude_object_ids:
+            continue
+        shape = el.get("shape")
+        if not shape or "text" not in shape:
+            continue
+        full_text = ""
+        style_for_longest_run: dict = {}
+        longest = 0
+        for te in shape.get("text", {}).get("textElements", []):
+            run = te.get("textRun", {})
+            content = run.get("content") or ""
+            if not content.strip():
+                continue
+            full_text += content
+            if len(content) > longest:
+                longest = len(content)
+                style_for_longest_run = run.get("style") or {}
+        stripped = full_text.strip()
+        if len(stripped) < 4:
+            continue
+        flat = _style_dict_from_slides_text_run(style_for_longest_run)
+        if not flat.get("font_family") and not flat.get("color"):
+            continue
+        n_chars = len(stripped)
+        if n_chars > best_chars:
+            best_chars = n_chars
+            best = flat
+    return best
+
+
+def _build_update_text_style_api_fields(st: dict[str, Any]) -> tuple[dict, list[str]]:
+    """Build Slides API style object + fields list from flat st."""
+    style: dict = {}
+    fields: list[str] = []
+    if "font_size_pt" in st:
+        style["fontSize"] = {"magnitude": st["font_size_pt"], "unit": "PT"}
+        fields.append("fontSize")
+    if "bold" in st:
+        style["bold"] = st["bold"]
+        fields.append("bold")
+    if "italic" in st:
+        style["italic"] = st["italic"]
+        fields.append("italic")
+    if "underline" in st:
+        style["underline"] = st["underline"]
+        fields.append("underline")
+    if st.get("font_family"):
+        style["fontFamily"] = st["font_family"]
+        fields.append("fontFamily")
+    if st.get("color"):
+        style["foregroundColor"] = {
+            "opaqueColor": {"rgbColor": hex_to_rgb(st["color"])}
+        }
+        fields.append("foregroundColor")
+    return style, fields
+
+
+def _ordered_instructions_for_batch_update(instructions: list[dict]) -> list[dict]:
+    """Run replace_text (and its insert) before update_text_style so empty boxes work."""
+    replaces = [i for i in instructions if i.get("action") == "replace_text"]
+    others = [i for i in instructions if i.get("action") != "replace_text"]
+    return replaces + others
+
+
 def edit_instructions_to_batch_requests(
-    instructions: list[dict], page_json: dict,
+    instructions: list[dict],
+    page_json: dict,
+    fallback_text_style: Optional[dict[str, Any]] = None,
 ) -> list[dict]:
     """
     Convert LLM instructions (move/resize/replace_text/update_text_style)
@@ -199,8 +312,19 @@ def edit_instructions_to_batch_requests(
     for el in page_json.get("pageElements", []):
         el_map[el["objectId"]] = el
 
+    replace_target_ids = {
+        i.get("objectId")
+        for i in instructions
+        if i.get("action") == "replace_text" and i.get("objectId")
+    }
+    explicit_style_update_ids = {
+        i.get("objectId")
+        for i in instructions
+        if i.get("action") == "update_text_style" and i.get("objectId")
+    }
+
     requests = []
-    for inst in instructions:
+    for inst in _ordered_instructions_for_batch_update(instructions):
         action = inst.get("action")
 
         if action in ("create_slide", "create_shape", "create_line"):
@@ -222,10 +346,32 @@ def edit_instructions_to_batch_requests(
             requests.append({
                 "insertText": {"objectId": obj_id, "text": new_text, "insertionIndex": 0}
             })
+            # Newly inserted text inherits theme defaults (often Arial gray). Apply style
+            # from the rest of the slide unless the model already sent update_text_style.
+            if obj_id not in explicit_style_update_ids:
+                inferred = infer_body_text_style_from_page(
+                    page_json, exclude_object_ids={obj_id}
+                )
+                st = inferred if inferred else fallback_text_style
+                if st:
+                    api_style, fields = _build_update_text_style_api_fields(st)
+                    if api_style and fields:
+                        requests.append({
+                            "updateTextStyle": {
+                                "objectId": obj_id,
+                                "textRange": {"type": "ALL"},
+                                "style": api_style,
+                                "fields": ",".join(fields),
+                            }
+                        })
+                        print(
+                            f"   REPLACE_TEXT: auto updateTextStyle for {obj_id} "
+                            f"(source={'slide_sample' if inferred else 'fallback'}): {st}"
+                        )
             continue
 
         if action == "update_text_style":
-            if not has_text:
+            if not has_text and obj_id not in replace_target_ids:
                 print(f"   SLIDES: skipping update_text_style for {obj_id} (no text)")
                 continue
             style = {}
@@ -353,6 +499,7 @@ def apply_instructions(
     page_id: str,
     page_json: dict,
     access_token: str,
+    text_style_fallback: Optional[dict[str, Any]] = None,
 ) -> tuple[int, int, Optional[str]]:
     """
     Apply a list of instructions. Returns (shapes_created, elements_updated, error_msg).
@@ -384,7 +531,23 @@ def apply_instructions(
         except Exception as e:
             return shapes_created, elements_updated, f"Error creating line: {e}"
 
-    layout_requests = edit_instructions_to_batch_requests(instructions, page_json)
+    fb = None
+    if text_style_fallback:
+        fb = {
+            "font_family": text_style_fallback.get("primary_font"),
+            "color": text_style_fallback.get("primary_text_color"),
+        }
+        fs = text_style_fallback.get("primary_font_size_pt")
+        if fs is not None:
+            try:
+                fb["font_size_pt"] = float(fs)
+            except (TypeError, ValueError):
+                pass
+        fb = {k: v for k, v in fb.items() if v is not None}
+
+    layout_requests = edit_instructions_to_batch_requests(
+        instructions, page_json, fallback_text_style=fb or None
+    )
     if layout_requests:
         try:
             execute_batch_update(presentation_id, layout_requests, access_token)
