@@ -133,6 +133,8 @@ The same Google token is sent with chat requests (header `X-Google-Access-Token`
 
 ## Next Steps:
 
-1. multi-tool call loop
-2. planning loop (task decomposition, step planning, goal tracking)
-3. persistent working state (current goal, plan (multi-step), intermediate results, tool outputs, world model (files, codebase, UI state, etc.), memory (short-term + long-term))
+1. improve slides agent accuracy
+2. multi-tool call loop
+3. rate limiting
+4. planning loop (task decomposition, step planning, goal tracking)
+5. persistent working state (current goal, plan (multi-step), intermediate results, tool outputs, world model (files, codebase, UI state, etc.), memory (short-term + long-term))
