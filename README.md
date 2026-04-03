@@ -133,8 +133,10 @@ The same Google token is sent with chat requests (header `X-Google-Access-Token`
 
 ## Next Steps:
 
-1. improve slides agent accuracy
-2. multi-tool call loop
-3. rate limiting
-4. planning loop (task decomposition, step planning, goal tracking)
-5. persistent working state (current goal, plan (multi-step), intermediate results, tool outputs, world model (files, codebase, UI state, etc.), memory (short-term + long-term))
+1. Chunk/document embedding cache. When screenshots or Google Docs/Sheets content come in, you extract text and embed chunks before storing them in MongoDB. If the same page content is captured again, you do not want to re-embed identical text chunks. Instead, hash normalized chunk text and reuse existing embeddings. Since Dex2 captures visited pages repeatedly from the extension background worker, this is the most natural cache point. 
+2. Page-content dedupe before embedding. Slightly different from an embedding cache, but very related. Before enqueuing embedding work in /api/embed-screenshot/, compute a fingerprint of the extracted page text. If the text is materially the same as the last version for that URL/tab, skip the whole embedding pipeline. Since your extension captures screenshots on tab activation and updates, this could cut a lot of waste.
+3. improve slides agent accuracy
+3. multi-tool call loop
+4. rate limiting
+5. planning loop (task decomposition, step planning, goal tracking)
+6. persistent working state (current goal, plan (multi-step), intermediate results, tool outputs, world model (files, codebase, UI state, etc.), memory (short-term + long-term))
